@@ -22,7 +22,11 @@ import src.reward
 from src.config import Args, get_args
 from src.registry import DATA, MODEL, OPTIMIZER, SCHEDULER, LOSS, REWARD
 from src.policy_model_training.engine import run_one_epoch_grpo
-from src.policy_model_training.infer import export_topk_policy_samples_to_markdown
+from src.policy_model_training.infer import (
+    sample_topk_policy_samples,
+    export_topk_policy_samples_to_markdown,
+    export_topk_policy_samples_to_tensorboard,
+)
 
 from src.torchutils.common import set_cudnn_auto_tune, set_reproducible, generate_random_seed, disable_debug_api
 from src.torchutils.common import set_proper_device, get_device
@@ -124,6 +128,17 @@ def main_worker(local_rank: int,
         states=states,
     )
     
+    # 采样一次，同时用于 markdown 与 TensorBoard 导出
+    top_samples = sample_topk_policy_samples(
+        policy_model=policy_model,
+        surrogate_model=surrogate_model,
+        reward_fn=reward_impl,
+        device=get_device(),
+        n_samples = conf.get_int("infer.n_samples"),
+        batch_size = conf.get_int("infer.batch_size"),
+        top_k = conf.get_int("infer.top_k"),
+    )
+
     export_topk_policy_samples_to_markdown(
         policy_model=policy_model,
         surrogate_model=surrogate_model,
@@ -133,8 +148,19 @@ def main_worker(local_rank: int,
         # sampling config
         n_samples = conf.get_int("infer.n_samples"),
         batch_size = conf.get_int("infer.batch_size"),
-        top_k = conf.get_int("infer.top_k")
+        top_k = conf.get_int("infer.top_k"),
+        precomputed_samples=top_samples,
     )
+
+    # 把 Top-K 的 S 参数曲线写入 TensorBoard（每个设计一个 run）
+    export_topk_policy_samples_to_tensorboard(
+        top_samples=top_samples,
+        log_dir=args.output_dir,
+        reward_fn=reward_impl,
+        tag_prefix="topk_design",
+    )
+    writer.flush()
+
     
 
 def main(args: Args):

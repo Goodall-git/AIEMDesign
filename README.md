@@ -114,15 +114,39 @@ tensorboard --logdir=rl_output/          # 强化学习结果
 
 - `train/lr`、`train/policy_loss`、`train/reward`、`train/entropy`、`train/adv`
 - 以及对应的 `train/raw_*` 单批原始值
+- `topk_design/S11`、`topk_design/S21`、`topk_design/S22`：训练结束后，把 reward
+  最高的前 K 个版图的**完整 S 参数曲线**写入 TensorBoard。每个设计是一个独立
+  run（`topk_design_rank01` ~ `topk_design_rank0K`，rank01 为 reward 最高），
+  横轴为频率(GHz)，因此 S11/S21/S22 三张图里各能直接对比 K 条曲线；
+  `topk_design/reward` 记录该设计的 reward 数值。
+
+> 注意：这里的曲线是**代理模型的预测值**，可信度取决于代理模型在该输入分布上的
+> 外推能力。若设计的填充率远超训练集分布（见 `report.md`），预测曲线可能失真。
 
 ### Top-K 设计导出
 
 强化学习训练结束后会自动把采样结果的前 K 名写成
-`rl_output/01/topk_samples.md`，每个样本包含：
+`rl_output/01/topk_samples.md`，同时把前 K 名版图的完整 S 参数曲线写入
+TensorBoard（见上一节）。每个样本包含：
 
 - `TM2` / `TM3` / `V1` 三个 19×15 拓扑矩阵
 - 指定频段（默认 6.4 ~ 7.1 GHz）上 S11 / S21 / S22 的预测幅度(dB)
 - reward 数值
+
+### 对已有训练结果补写 Top-K 曲线
+
+若想在不重新训练的情况下，为已有的 RL 输出目录补写（或改变 K）Top-K 曲线：
+
+```bash
+python -m src.policy_model_training.export_topk_to_tensorboard \
+  --conf conf/rl.conf \
+  --rl-output rl_output/01 \
+  --policy-ckpt rl_output/01/checkpoint.pt \
+  --top-k 5
+```
+
+脚本会重新采样 `infer.n_samples` 个版图、取前 K 名，写入
+`<rl-output>/topk_design_rank0X/`，然后可用 `tensorboard --logdir=rl_output/` 查看。
 
 ## 奖励函数（RL 优化目标）
 
