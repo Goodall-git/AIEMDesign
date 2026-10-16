@@ -1,1 +1,1 @@
-from .band_rew import MultiSParamBandReward
+from .band_rew import MultiSParamBandReward, BandpassFilterReward
