@@ -1,0 +1,114 @@
+max_episodes: 10000
+
+log_interval: 10
+
+save_interval: 100
+
+set_reproducible: false # if true, the training will be set to reproducible (refer to https://pytorch.org/docs/stable/notes/randomness.html)
+                        # else torch.backends.cudnn.benchmark will be set to True for largest throughput
+
+# 逐行生成 3 个 19x15 二值矩阵：共 3*19 = 57 步，每步 15 bit，词表 2^15 = 32768
+policy_model {
+    type_: AntennaRowPolicyModel
+    n_matrices: 3
+    n_rows: 19
+    row_bits: 15
+    hidden_size: 64
+    temperature: null
+    # tanh 压缩会把 logits 限制在 ±tanh_constant，词表 32768 时 softmax 会接近均匀分布
+    # 且梯度饱和，因此这里关闭；如需回到旧行为可设为 1.5
+    tanh_constant: null
+}
+
+surrogate_model {
+    type_: EMResnet
+    layers: [2,2,2]
+    in_channels: 3
+    out_dim: 303
+    # 回归头配置必须与 conf/surrogate.conf 的 model 段完全一致，
+    # 否则 load_state_dict 会因参数名/形状不匹配而报错
+    head_type: spectral
+    spatial: [19, 15]
+    n_freq: 101
+    head_hidden: 256
+    head_mid: 128
+    head_conv_layers: 3
+    head_conv_kernel: 5
+    head_dropout: 0.0
+    load_from: surrogate_output/01/checkpoint.pt  # 上一步仿真模型训练的输出，需按实际路径修改
+}
+
+rl {
+    batch_size: 32
+    entropy_coef: 0.001
+    adv_eps: 1e-8
+    grad_clip_norm: null
+}
+
+infer {
+    n_samples: 100
+    batch_size: 100
+    top_k: 10
+}
+
+# 带通滤波器形状：全频带优化（带内 + 带外一起约束）
+#   带内：S21 越大越好（插损小）、S11 / S22 越小越好（匹配好）
+#   带外：S21 越小越好（抑制 / 滚降，这是形成滤波形状的关键）
+#
+#   reward = + w_s21_pass * mean(S21_dB[带内])
+#            - w_s11_pass * mean(S11_dB[带内])
+#            - w_s22_pass * mean(S22_dB[带内])
+#            - w_s21_stop * agg(S21_dB[带外])
+#
+# 各项都在 dB 尺度上，权重即兑换比：w_s21_pass=2 且 w_s21_stop=1 表示
+# “带内 1 dB 插损 == 带外 2 dB 抑制”。
+# 注意别让带外的权重相对带内 S21 过大，否则策略会去找“整条曲线一起压到
+# -60 dB”的退化解（例如整块金属屏蔽）来白拿三项分。
+reward {
+    type_: BandpassFilterReward
+    passband: [6.4, 7.1]
+
+    # 频率轴，必须与 data 配置一致（0 ~ 10 GHz，101 点）
+    freq_start_ghz: 0.0
+    freq_end_ghz: 10.0
+    num_points: 101
+    s_param_order: [S11, S21, S22]
+
+    # ---- 带内 ----
+    weight_s21_pass: 2.0   # 插损：越大越好（权重最高，保证带内是"通"的）
+    weight_s11_pass: 1.0   # 输入匹配：越小越好
+    weight_s22_pass: 1.0   # 输出匹配：越小越好
+
+    # ---- 带外 ----
+    weight_s21_stop: 1.0   # 抑制 / 滚降：越小越好
+    stopband_aggregation: mean   # mean=带外平均抑制 | max=带外最差点(更严格)
+
+    # ---- 可选指标阈值（null = 关闭，用上面的纯加权）----
+    # 设值后对应项变成"只罚不奖"的 hinge，达到指标后不再加分，
+    # 可彻底消除上面说的刷分动机。例如严格设计可设为：
+    #   target_s21_pass_db: -3.0    # 带内插损不低于 -3 dB
+    #   target_s11_pass_db: -10.0   # 带内回波不高于 -10 dB
+    #   target_s22_pass_db: -10.0
+    #   target_s21_stop_db: -20.0   # 带外抑制至少 20 dB
+    target_s21_pass_db: null
+    target_s11_pass_db: null
+    target_s22_pass_db: null
+    target_s21_stop_db: null
+
+    # 预测值可能超出数据范围，截断到与数据集一致的 dB 区间
+    clamp_db: [-60.0, 0.0]
+}
+
+optimizer {
+    type_: AdamW
+    lr: 0.0001
+    betas: [0.9, 0.95]
+    eps: 1e-8
+    weight_decay: 1e-5
+}
+
+scheduler {
+    type_: CosineAnnealingLR
+    T_max: ${max_episodes}
+    eta_min: 0.0001
+}

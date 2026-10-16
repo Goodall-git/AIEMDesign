@@ -36,6 +36,21 @@ class AntennaRowPolicyModel(nn.Module):
         hidden_size: int = 64,
         temperature=None,
         tanh_constant: float = 1.5,
+        # ---- 稀疏通道（V1）密度约束 ----
+        # 训练数据里 V1 通道极度稀疏：285 个像素中白点数 mean=6.84、max=20，
+        # 单行白点 max=6，71.5% 的行全空；而 TM2/TM3 的密度约 0.45 / 0.51。
+        # 若不加约束，策略会把 V1 刷白到训练分布之外（实测 top-k 设计密度达
+        # 0.70~0.81，z-score≈+37），此时代理模型纯属外推，会报出虚假的优异
+        # S 参数（reward hacking），而真实仿真中该结构并不存在——训练集里
+        # 1122 个好设计（S11<-15dB 且 S21>-3dB）的 V1 白点数 max 也只有 20。
+        #
+        #   v1_max_total:   整个 V1 矩阵的白点总数上限（训练集 max=20）
+        #   v1_max_per_row: 单行白点上限（训练集 max=6）
+        #
+        # 两者均为 None 时退化为原行为（不约束）。
+        v1_matrix_index: int = 2,
+        v1_max_total: int | None = None,
+        v1_max_per_row: int | None = None,
     ):
         super().__init__()
         if n_matrices <= 0 or n_rows <= 0 or row_bits <= 0:
@@ -54,11 +69,37 @@ class AntennaRowPolicyModel(nn.Module):
 
         self.vocab_size = 2 ** row_bits
 
+        # ---- 稀疏通道约束参数 ----
+        self.v1_matrix_index = int(v1_matrix_index)
+        self.v1_max_total = None if v1_max_total is None else int(v1_max_total)
+        self.v1_max_per_row = None if v1_max_per_row is None else int(v1_max_per_row)
+        if not (0 <= self.v1_matrix_index < n_matrices):
+            raise ValueError(
+                f"v1_matrix_index 必须落在 [0, {n_matrices}) 内，当前为 "
+                f"{self.v1_matrix_index}")
+        if self.v1_max_per_row is not None and not (0 <= self.v1_max_per_row <= row_bits):
+            raise ValueError(
+                f"v1_max_per_row 必须落在 [0, {row_bits}] 内，当前为 "
+                f"{self.v1_max_per_row}")
+        if self.v1_max_total is not None and self.v1_max_total < 0:
+            raise ValueError(f"v1_max_total 不能为负，当前为 {self.v1_max_total}")
+        self._v1_constrained = (
+            self.v1_max_total is not None or self.v1_max_per_row is not None)
+
         self.action_embedding = nn.Embedding(self.vocab_size, hidden_size)
         self.start_token = nn.Parameter(torch.zeros(hidden_size))
 
         self.lstm = nn.LSTMCell(hidden_size, hidden_size)
         self.logits_head = nn.Linear(hidden_size, self.vocab_size)
+
+        # 每个动作（15 bit 行编码）对应的白点数，用于约束 V1 的密度。
+        # 注册为非持久化 buffer：不会进入 state_dict，因此与旧 checkpoint
+        # 以及并行保存/加载逻辑保持兼容。
+        self.register_buffer(
+            "_row_popcount",
+            torch.tensor([bin(i).count("1") for i in range(self.vocab_size)],
+                         dtype=torch.long),
+            persistent=False)
 
         self.reset_parameters()
 
@@ -123,7 +164,10 @@ class AntennaRowPolicyModel(nn.Module):
         # 第一步输入：start token，扩展到 batch
         embed = self.start_token.unsqueeze(0).expand(batch_size, -1)  # (B, H)
 
-        for _ in range(self.n_steps):
+        # V1 通道已占用的白点预算（仅在启用约束时使用）：(B,)
+        used_white = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+
+        for step in range(self.n_steps):
             hx, cx = self.lstm(embed, (hx, cx))
 
             if force_uniform:
@@ -132,8 +176,24 @@ class AntennaRowPolicyModel(nn.Module):
                 logits = self.logits_head(hx)
                 logits = self._scale_logits(logits)
 
+            # 稀疏通道约束：把会超出密度上限的动作概率置 0（logits = -inf）。
+            # popcount=0 的全空行恒满足两个上限，故合法集合非空，
+            # softmax 不会出现全 -inf 导致的 NaN。
+            if self._v1_constrained and (step // self.n_rows) == self.v1_matrix_index:
+                popcount = self._row_popcount.unsqueeze(0)           # (1, V)
+                legal = torch.ones_like(popcount, dtype=torch.bool)  # (1, V)
+                if self.v1_max_per_row is not None:
+                    legal = legal & (popcount <= self.v1_max_per_row)
+                if self.v1_max_total is not None:
+                    legal = legal & (popcount + used_white.unsqueeze(1)
+                                     <= self.v1_max_total)
+                logits = logits.masked_fill(~legal, float("-inf"))
+
             probs = F.softmax(logits, dim=-1)
             action, logp, entropy = self._sample_action(probs)
+
+            if self._v1_constrained and (step // self.n_rows) == self.v1_matrix_index:
+                used_white = used_white + self._row_popcount[action]
 
             actions_buf.append(action)      # (B,)
             logp_buf.append(logp)           # (B,)
