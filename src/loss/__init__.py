@@ -13,3 +13,8 @@ LOSS.register(nn.L1Loss)
 # 在 PyTorch 中可以通过 nn.HuberLoss(delta=...) 指定 delta，
 # delta 越小越偏向 MAE，越大越偏向 MSE —— 可作为超参数调优。
 LOSS.register(nn.HuberLoss)
+# 物理约束损失：无源性惩罚（详见 src/loss/passivity.py）
+from . import passivity  # noqa: F401
+
+# 谐振样本加权损失（详见 src/loss/resonance.py）
+from . import resonance  # noqa: F401

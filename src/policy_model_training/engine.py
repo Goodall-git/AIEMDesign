@@ -55,13 +55,14 @@ def run_one_epoch_grpo(
     reward_metric = AverageMetric("avg_reward", format_digits=8)
     entropy_metric = AverageMetric("avg_entropy", format_digits=8)
     adv_metric = AverageMetric("avg_adv", format_digits=8)
+    adv_std_metric = AverageMetric("avg_adv_std", format_digits=8)
 
     eta = EstimatedTimeArrival(max_episodes)
     speed_tester = ThroughputTester()
 
-    lr = optimizer.param_groups[0]["lr"]
     _logger.info(
-        f"RL TRAIN start, epoch={max_episodes:04d}, lr={lr:.6f}, "
+        f"RL TRAIN start, epoch={max_episodes:04d}, "
+        f"lr={optimizer.param_groups[0]['lr']:.6f}, "
         f"iters={max_episodes}, batch={batch_size}"
     )
 
@@ -127,14 +128,22 @@ def run_one_epoch_grpo(
         reward_metric.update(rewards.mean())
         entropy_metric.update(entropy_sum.mean())
         adv_metric.update(adv.mean())
+        adv_std_metric.update(adv.std(unbiased=False))
 
         eta.step()
         speed_tester.update(topo)
+
+        # scheduler.step() 必须在读取 lr 之前，否则写进日志/TensorBoard 的
+        # 永远是第 0 步的学习率（旧版实测 10000 iter 全程 lr=0.0001）。
+        if scheduler is not None:
+            scheduler.step()
+        lr = optimizer.param_groups[0]["lr"]
 
         if iter_ % log_interval == 0 or iter_ == max_episodes:
             _logger.info(", ".join([
                 "RL-TRAIN",
                 f"iter={iter_:05d}/{max_episodes:05d}",
+                f"lr={lr:.8f}",
                 f"time={time_cost_metric.compute()*1000:.2f}ms",
                 f"fps={speed_tester.compute()*world_size():.0f} samples/s",
                 f"raw policy_loss={policy_loss.item():.8f}",
@@ -145,11 +154,20 @@ def run_one_epoch_grpo(
                 f"{entropy_metric}",
                 f"raw adv={adv.mean().item():.8f}",
                 f"{adv_metric}",
+                f"raw adv_std={adv.std(unbiased=False).item():.8f}",
+                f"{adv_std_metric}",
                 f"{eta}",
             ]))
+            # 这些是「自上次 log 以来的平均」，必须 reset，否则会变成
+            # 全局累计平均，与 raw_* 严重脱节（旧版 avg_reward=-0.54 vs raw 43）。
+            policy_loss_metric.reset()
+            reward_metric.reset()
+            entropy_metric.reset()
+            adv_metric.reset()
+            adv_std_metric.reset()
             time_cost_metric.reset()
             speed_tester.reset()
-            
+
         writer.add_scalar("train/lr", lr, iter_)
         writer.add_scalar("train/raw_policy_loss", policy_loss.item(), iter_)
         writer.add_scalar("train/policy_loss", policy_loss_metric.compute(), iter_)
@@ -159,18 +177,15 @@ def run_one_epoch_grpo(
         writer.add_scalar("train/entropy", entropy_metric.compute(), iter_)
         writer.add_scalar("train/raw_adv", adv.mean().item(), iter_)
         writer.add_scalar("train/adv", adv_metric.compute(), iter_)
+        writer.add_scalar("train/raw_adv_std", adv.std(unbiased=False).item(), iter_)
+        writer.add_scalar("train/adv_std", adv_std_metric.compute(), iter_)
 
-
-        if scheduler is not None:
-            scheduler.step()
-            
-
-        
         metric_store += {
             "train/lr": lr,
             "train/policy_loss": policy_loss_metric.compute(),
             "train/reward": reward_metric.compute(),
             "train/entropy": entropy_metric.compute(),
+            "train/adv_std": adv_std_metric.compute(),
         }
         
         if iter_ % save_interval == 0 or iter_ == max_episodes:

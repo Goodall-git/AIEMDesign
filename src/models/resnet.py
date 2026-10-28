@@ -129,7 +129,8 @@ class SpectralHead(nn.Module):
     """
 
     def __init__(self, in_channels, spatial, out_dim, n_freq=101,
-                 hidden=256, mid=128, n_layers=3, kernel_size=5, dropout=0.0):
+                 hidden=256, mid=128, n_layers=3, kernel_size=5, dropout=0.0,
+                 freq_mod_rank=0):
         super(SpectralHead, self).__init__()
         h, w = spatial
         self.spatial = (int(h), int(w))
@@ -150,6 +151,26 @@ class SpectralHead(nn.Module):
         # 2) 频率位置编码：让每个频点拥有自己的偏置
         self.freq_pos = nn.Parameter(torch.zeros(1, hidden, self.n_freq))
         nn.init.normal_(self.freq_pos, std=0.02)
+
+        # 2b) 样本相关的频率调制（低秩）。
+        #
+        # 只有 freq_pos 时，输入对频率轴的贡献是「沿频率恒定的向量」，卷积
+        # 后仍是恒定分量 —— 模型只能整体抬降曲线，无法在**由输入决定的**
+        # 频率上制造局部凹陷。实测：代理模型预测带内最小值很准（corr 0.99），
+        # 但预测「凹陷深度/位置」的相关性是负的（-0.27）。
+        #
+        # 这里给每个样本预测一组低秩系数，再乘一组可学习的频率基：
+        #     x += einsum('br,rhf->bhf', coeff(seed), freq_basis)
+        # rank=0 时完全关闭，保持与旧 checkpoint 兼容。
+        self.freq_mod_rank = int(freq_mod_rank)
+        if self.freq_mod_rank > 0:
+            self.freq_mod = nn.Linear(hidden, self.freq_mod_rank)
+            self.freq_basis = nn.Parameter(
+                torch.zeros(self.freq_mod_rank, hidden, self.n_freq))
+            nn.init.normal_(self.freq_basis, std=0.01)
+        else:
+            self.freq_mod = None
+            self.freq_basis = None
 
         # 3) 频率方向的 1D 卷积：局部平滑 + 相邻频点共享权重
         layers = []
@@ -174,8 +195,11 @@ class SpectralHead(nn.Module):
                 f"spatial={self.spatial} 不一致，请检查 conf 里 model.spatial")
 
         x = feat.flatten(1)                     # (B, C*H*W)
-        x = self.drop(self.act(self.fc(x)))     # (B, hidden)
-        x = x.unsqueeze(-1) + self.freq_pos     # (B, hidden, n_freq)
+        seed = self.drop(self.act(self.fc(x)))  # (B, hidden)
+        x = seed.unsqueeze(-1) + self.freq_pos  # (B, hidden, n_freq)
+        if self.freq_mod is not None:
+            coeff = self.freq_mod(seed)         # (B, rank)
+            x = x + torch.einsum("br,rhf->bhf", coeff, self.freq_basis)
         x = self.refine(x)                      # (B, mid, n_freq)
         x = self.out_conv(x)                    # (B, n_s_params, n_freq)
         return x.flatten(1)                     # (B, out_dim)
@@ -186,7 +210,7 @@ class CifarResNet(nn.Module):
     def __init__(self, block, layers, in_channels=1, out_dim=1000,
                  head_type="spectral", spatial=(19, 15), n_freq=101,
                  head_hidden=256, head_mid=128, head_conv_layers=3,
-                 head_conv_kernel=5, head_dropout=0.0):
+                 head_conv_kernel=5, head_dropout=0.0, freq_mod_rank=0):
         super(CifarResNet, self).__init__()
         self.inplanes = 16
         self.conv1 = conv3x3(in_channels, 16)
@@ -209,6 +233,7 @@ class CifarResNet(nn.Module):
                 n_layers=head_conv_layers,
                 kernel_size=head_conv_kernel,
                 dropout=head_dropout,
+                freq_mod_rank=freq_mod_rank,
             )
         elif head_type == "gap":
             self.head = GAPHead(feat_channels, out_dim)
@@ -252,13 +277,15 @@ class CifarResNet(nn.Module):
 @MODEL.register
 def EMResnet(layers, in_channels, out_dim, head_type="spectral",
              spatial=(19, 15), n_freq=101, head_hidden=256, head_mid=128,
-             head_conv_layers=3, head_conv_kernel=5, head_dropout=0.0) -> CifarResNet:
+             head_conv_layers=3, head_conv_kernel=5, head_dropout=0.0,
+             freq_mod_rank=0) -> CifarResNet:
     return CifarResNet(BasicBlock, layers, in_channels, out_dim,
                        head_type=head_type, spatial=spatial, n_freq=n_freq,
                        head_hidden=head_hidden, head_mid=head_mid,
                        head_conv_layers=head_conv_layers,
                        head_conv_kernel=head_conv_kernel,
-                       head_dropout=head_dropout)
+                       head_dropout=head_dropout,
+                       freq_mod_rank=freq_mod_rank)
 
 if __name__ == "__main__":
     # 与项目当前数据一致：3 通道 19x15 版图 -> S11/S21/S22 x 101 频点 = 303

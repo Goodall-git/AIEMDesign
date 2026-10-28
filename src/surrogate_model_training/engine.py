@@ -1,3 +1,4 @@
+import copy
 import functools
 import logging
 
@@ -13,6 +14,47 @@ from src.torchutils.common import ThroughputTester, time_enumerate
 
 _logger = logging.getLogger(__name__)
 
+
+class ModelEMA:
+    """
+    权重指数滑动平均（Exponential Moving Average）。
+
+    小数据集（本项目 3762 条）上模型的验证误差会随 epoch 剧烈波动，直接取
+    「验证最优的那个 epoch」容易被噪声选到运气好的点。EMA 权重相当于把
+    最近若干步的参数做平均，泛化通常更稳、更不容易过拟合。
+
+    只在 train_one_epoch 里更新，eval 时用 ema_model 前向。
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = float(decay)
+        self.module = copy.deepcopy(model).eval()
+        for p in self.module.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        d = self.decay
+        for ema_p, p in zip(self.module.parameters(), model.parameters()):
+            ema_p.mul_(d).add_(p.detach(), alpha=1.0 - d)
+        # buffer（BatchNorm 的 running stats 等）直接复制，不做平均
+        for ema_b, b in zip(self.module.buffers(), model.buffers()):
+            ema_b.copy_(b)
+
+    def state_dict(self):
+        return self.module.state_dict()
+
+    def load_state_dict(self, state_dict):
+        self.module.load_state_dict(state_dict)
+
+    def train(self, mode=True):
+        self.module.train(mode)
+        return self
+
+    def __call__(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
+
+
 def _run_one_epoch(is_training: bool,
                    epoch: int,
                    model: nn.Module,
@@ -21,7 +63,9 @@ def _run_one_epoch(is_training: bool,
                    optimizer: optim.Optimizer,
                    scheduler: optim.lr_scheduler._LRScheduler,
                    device: str,
-                   log_interval: int):
+                   log_interval: int,
+                   grad_clip_norm: float = None,
+                   ema: ModelEMA = None):
     phase = "train" if is_training else "eval"
     model.train(mode=is_training)
 
@@ -33,7 +77,7 @@ def _run_one_epoch(is_training: bool,
 
     lr = optimizer.param_groups[0]['lr']
     _logger.info(f"{phase.upper()} start, epoch={epoch:04d}, lr={lr:.6f}")
-    
+
     point_wise_l1_distance_list = []
 
     for time_cost, iter_, (inputs, targets) in time_enumerate(loader, start=1):
@@ -41,21 +85,28 @@ def _run_one_epoch(is_training: bool,
         targets = targets.to(device=device, non_blocking=True)
 
         with torch.set_grad_enabled(mode=is_training):
-            outputs = model(inputs)
+            # 评估时如果启用了 EMA，用平均权重前向（这才是最终会保存/使用的权重）
+            if not is_training and ema is not None:
+                outputs = ema.module(inputs)
+            else:
+                outputs = model(inputs)
             loss: torch.Tensor = criterion(outputs, targets)
 
         if is_training:
             optimizer.zero_grad()
             loss.backward()
+            if grad_clip_norm is not None and grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
             optimizer.step()
+            if ema is not None:
+                ema.update(model)
 
         with torch.no_grad():
             l1_distance = torch.abs(outputs - targets).mean()
-        
+
             if not is_training:
-                if epoch // 10 == 0:
-                    point_wise_l1_distance = torch.abs(outputs - targets).mean(dim=0)
-                    point_wise_l1_distance_list.append(point_wise_l1_distance)
+                point_wise_l1_distance = torch.abs(outputs - targets).mean(dim=0)
+                point_wise_l1_distance_list.append(point_wise_l1_distance)
 
         time_cost_metric.update(time_cost)
         loss_metric.update(loss)
@@ -81,7 +132,7 @@ def _run_one_epoch(is_training: bool,
 
     if is_training and scheduler is not None:
         scheduler.step()
-        
+
     _logger.info(", ".join([
         phase.upper(),
         f"epoch={epoch:04d} {phase} complete",

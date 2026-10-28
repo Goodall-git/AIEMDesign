@@ -161,11 +161,15 @@ def export_topk_policy_samples_to_tensorboard(
     S11 / S21 / S22 三张图中各会出现 K 条曲线，可直接对比。
 
     写入的 tag（每个 run 下）：
-    - {tag_prefix}/S11, .../S21, .../S22 : 逐频点幅度(dB)，横轴=频率(GHz)
+    - {tag_prefix}/S11, .../S21, .../S22 : 逐频点幅度(dB)，横轴=频率(MHz)
     - {tag_prefix}/reward                 : 该设计的 reward（常量曲线）
 
     实现要点：先在内存中构建一个临时 SummaryWriter，再把事件文件拷贝到目标
     run 子目录，从而绕开 "同一 SummaryWriter 只能对应一个 run" 的限制。
+
+    注意：TensorBoard 的 scalar step 必须是整数，不能直接传 GHz 浮点数
+    （7.5/7.6/... 会被截断成 7/7/...，曲线会出现阶梯）。这里统一用 MHz
+    作为 step，例如 7500 表示 7.5 GHz。
     """
     import glob
     import shutil
@@ -198,7 +202,8 @@ def export_topk_policy_samples_to_tensorboard(
                 curve = full_s[si].tolist()
                 for fi in range(num_points):
                     tmp_writer.add_scalar(
-                        f"{tag_prefix}/{sname}", curve[fi], float(freq[fi]))
+                        f"{tag_prefix}/{sname}", curve[fi],
+                        int(round(float(freq[fi]) * 1000)))
             tmp_writer.add_scalar(f"{tag_prefix}/reward", s.reward, 0)
             tmp_writer.flush()
             tmp_writer.close()

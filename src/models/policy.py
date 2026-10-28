@@ -51,6 +51,16 @@ class AntennaRowPolicyModel(nn.Module):
         v1_matrix_index: int = 2,
         v1_max_total: int | None = None,
         v1_max_per_row: int | None = None,
+        # ---- 联合密度约束（覆盖全部通道）----
+        # 只约束 V1 通道会让策略把压力转移到 TM2/TM3（实测 top-k 被刷到
+        # 0.97/1.00，远超训练集上限 0.825/0.937）。这里约束的是三个通道的
+        # 「联合白点总数」，从机制上封住这种转移。
+        #
+        #   total_max_white: 三个矩阵合计白点数上限（855 个像素）
+        #
+        # 训练集实测：p99=397、max=474（整体填充率 max 0.554）。
+        # 取 474 即「不允许超过训练集见过的最密样本」。
+        total_max_white: int | None = None,
     ):
         super().__init__()
         if n_matrices <= 0 or n_rows <= 0 or row_bits <= 0:
@@ -83,8 +93,16 @@ class AntennaRowPolicyModel(nn.Module):
                 f"{self.v1_max_per_row}")
         if self.v1_max_total is not None and self.v1_max_total < 0:
             raise ValueError(f"v1_max_total 不能为负，当前为 {self.v1_max_total}")
+        self.total_max_white = (
+            None if total_max_white is None else int(total_max_white))
+        if self.total_max_white is not None:
+            if not (0 <= self.total_max_white <= n_matrices * n_rows * row_bits):
+                raise ValueError(
+                    f"total_max_white 必须落在 [0, {n_matrices * n_rows * row_bits}] 内，"
+                    f"当前为 {self.total_max_white}")
         self._v1_constrained = (
             self.v1_max_total is not None or self.v1_max_per_row is not None)
+        self._total_constrained = self.total_max_white is not None
 
         self.action_embedding = nn.Embedding(self.vocab_size, hidden_size)
         self.start_token = nn.Parameter(torch.zeros(hidden_size))
@@ -166,6 +184,8 @@ class AntennaRowPolicyModel(nn.Module):
 
         # V1 通道已占用的白点预算（仅在启用约束时使用）：(B,)
         used_white = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        # 三个通道合计已占用的白点数（仅在启用联合约束时使用）：(B,)
+        used_total = torch.zeros(batch_size, dtype=torch.long, device=self.device)
 
         for step in range(self.n_steps):
             hx, cx = self.lstm(embed, (hx, cx))
@@ -189,11 +209,20 @@ class AntennaRowPolicyModel(nn.Module):
                                      <= self.v1_max_total)
                 logits = logits.masked_fill(~legal, float("-inf"))
 
+            # 联合密度约束：任何一步（任意矩阵）都限制累计白点数。
+            # 全空行（popcount=0）恒合法，故合法集合非空，不会出现全 -inf。
+            if self._total_constrained:
+                popcount = self._row_popcount.unsqueeze(0)
+                legal = popcount + used_total.unsqueeze(1) <= self.total_max_white
+                logits = logits.masked_fill(~legal, float("-inf"))
+
             probs = F.softmax(logits, dim=-1)
             action, logp, entropy = self._sample_action(probs)
 
             if self._v1_constrained and (step // self.n_rows) == self.v1_matrix_index:
                 used_white = used_white + self._row_popcount[action]
+            if self._total_constrained:
+                used_total = used_total + self._row_popcount[action]
 
             actions_buf.append(action)      # (B,)
             logp_buf.append(logp)           # (B,)

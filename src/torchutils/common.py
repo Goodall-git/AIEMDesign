@@ -415,16 +415,60 @@ class StateCheckPoint:
         if metric_store.is_best_epoch():
             torchsave(checkpoint, self.output_directory / self.best_checkpoint_name)
 
-    def restore(self, metric_store: MetricsStore, states: dict, device="cuda:0"):
+    def restore(self, metric_store: MetricsStore, states: dict, device="cuda:0",
+                strict_shapes: bool = False):
         checkpoint_path = self.output_directory / self.checkpoint_name
-        if checkpoint_path.exists():
-            map_location = f"cuda:{device}" if isinstance(device, int) else device
-            checkpoint: dict = torch.load(checkpoint_path, map_location=map_location)
-            metric_store.update(checkpoint.pop("metrics", dict()))
-            for name, module in states.items():
-                if hasattr(module, "load_state_dict"):
-                    module.load_state_dict(checkpoint[name])
-            _logger.info(f"Load state checkpoint from {checkpoint_path} at epoch={metric_store.total_epoch}")
+        if not checkpoint_path.exists():
+            return
+        map_location = f"cuda:{device}" if isinstance(device, int) else device
+        checkpoint: dict = torch.load(checkpoint_path, map_location=map_location)
+
+        # 形状/键校验：直接 load_state_dict 遇到不匹配会抛异常并中断训练。
+        # 这里先比对，不匹配就告警并跳过（从零训练），避免残留的旧 checkpoint
+        # （例如换了回归头结构后）把整个训练卡死。
+        mismatch = self._find_mismatch(checkpoint, states)
+        if mismatch is not None:
+            message = (f"Checkpoint {checkpoint_path} 与当前模型不匹配：{mismatch}。"
+                       f"将忽略该 checkpoint 并从零开始训练。")
+            if strict_shapes:
+                raise RuntimeError(message)
+            _logger.warning(message)
+            return
+
+        metric_store.update(checkpoint.pop("metrics", dict()))
+        for name, module in states.items():
+            if hasattr(module, "load_state_dict"):
+                module.load_state_dict(checkpoint[name])
+        _logger.info(f"Load state checkpoint from {checkpoint_path} at epoch={metric_store.total_epoch}")
+
+    @staticmethod
+    def _find_mismatch(checkpoint: dict, states: dict):
+        """返回第一个不匹配的描述字符串；全部匹配则返回 None。"""
+        for name, module in states.items():
+            if not hasattr(module, "state_dict"):
+                continue
+            if name not in checkpoint:
+                return f"缺少 {name} 的权重"
+            expected = module.state_dict()
+            saved = checkpoint[name]
+            if not isinstance(saved, dict):
+                continue
+            for key, value in expected.items():
+                if key not in saved:
+                    return f"{name}.{key} 缺失"
+                # 只比较张量形状；scheduler 的 state_dict 里含 int/float/list
+                # （如 base_lrs、T_max），对它们取 .shape 会抛
+                # AttributeError: 'dict' object has no attribute 'shape'。
+                saved_v, expected_v = saved[key], value
+                if hasattr(saved_v, "shape") and hasattr(expected_v, "shape"):
+                    if tuple(saved_v.shape) != tuple(expected_v.shape):
+                        return (f"{name}.{key} 形状不匹配 "
+                                f"(checkpoint={tuple(saved_v.shape)}, "
+                                f"model={tuple(expected_v.shape)})")
+            for key in saved:
+                if key not in expected:
+                    return f"{name}.{key} 是多余的键"
+        return None
 
 
 class ThroughputTester():

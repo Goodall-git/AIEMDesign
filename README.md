@@ -120,7 +120,7 @@ python -m src.surrogate_model_training.main --conf conf/surrogate.conf -o surrog
 
 | `head_type` | 结构 | 适用场景 |
 |---|---|---|
-| `spectral`（**默认**） | 展平保留全部 19×15 空间位置 → `Linear` → 加频率位置编码 → 3 层 `Conv1d`（频率方向）→ `1x1 Conv1d` 出 3 通道 | 正常训练 |
+| `spectral`（**默认**） | 展平保留全部 19×15 空间位置 → `Linear` → 加频率位置编码 → 若干层 `Conv1d`（频率方向）→ `1x1 Conv1d` 出 3 通道 | 正常训练 |
 | `gap` | `AdaptiveAvgPool2d((1,1))` + 单层 `Linear` | 只用于和旧结构做对照实验 |
 
 前者的两个关键点：
@@ -150,9 +150,9 @@ model {
     n_freq: 101         # 频率点数；out_dim 必须等于 n_s_params * n_freq
     head_hidden: 256    # 展平后的投影维度（参数量主要来自这里）
     head_mid: 128       # 频率方向 1D 卷积的通道数
-    head_conv_layers: 3
+    head_conv_layers: 1  # 实测 1 层优于 3 层（曲线由少量真实频点插值而来）
     head_conv_kernel: 5
-    head_dropout: 0.0
+    head_dropout: 0.25   # 旧版 0.0 会明显过拟合
 }
 ```
 
@@ -168,7 +168,9 @@ model {
 | 想换回旧结构做对照 | `head_type: gap`，**需要重新训练**（两种头的参数名不同，权重不能互载） |
 | 改频率点数 | 同步改 `n_freq`、`out_dim`（= 3 × 点数）、`conf/rl.conf` 的 `reward.num_points`/`freq_*`，并重新生成数据 |
 | 版图尺寸变了 | 改 `spatial`，否则 `SpectralHead` 会直接抛出提示检查 `model.spatial` 的 `ValueError` |
-| 想加正则 | `head_dropout: 0.1`（默认 0.0 关闭） |
+| 想加正则 | `head_dropout`（默认 0.25）。注意它只作用在展平投影那一层 |
+| 想调训练轮次 | `max_epochs`（默认 200）**同时是余弦退火的 `T_max`**，两者必须一致 |
+| 想提前停止 | `early_stop_patience`（默认 80，设 null 关闭） |
 
 #### 自测
 
@@ -190,13 +192,16 @@ python src/models/resnet.py
 
 ## 搜索优化模型：强化学习训练
 
-1. 确认 `conf/rl.conf` 中 `surrogate_model.load_from` 指向上一步的输出
-   （默认 `surrogate_output/01/checkpoint.pt`）。
-2. 运行：
+1. 确认 `conf/rl.conf` 中 `surrogate_model.load_from` 指向上一步的输出，
+   并且**加载 `best_checkpoint.pt` 而不是 `checkpoint.pt`**（后者是最后一轮，
+   往往是过拟合的权重）。
+2. `conf/rl.conf` 的 `surrogate_model` 段必须与 `conf/surrogate.conf` 的 `model`
+   段完全一致（含 `head_conv_layers` / `head_dropout`），否则 `load_state_dict` 会报错。
+3. 运行：
 
 ```bash
 python -m src.policy_model_training.main --conf conf/rl.conf -o rl_output/01 \
-  -M surrogate_model.load_from=surrogate_output/01/checkpoint.pt
+  -M surrogate_model.load_from=surrogate_output/03/best_checkpoint.pt
 ```
 
 训练结果保存在 `rl_output/01/` 下。

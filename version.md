@@ -1,5 +1,87 @@
 # 版本说明（version.md）
 
+## V3.0（代理模型适配当前数据集 + 抑制过拟合）
+
+**目标**：让代理模型适配现有数据集（3762 / 418 条，3×19×15 版图 → 3×101 dB 曲线），
+并解决 V2.0 暴露的「训练轮次过多、严重过拟合」问题。
+
+**结果（val L1 / dB，越低越好）**
+
+| | train L1 | val L1 | 泛化差距 | 备注 |
+|---|---:|---:|---:|---|
+| V2.0（旧配置，epoch 59） | 0.31 | **2.61** | 8.6× | epoch 59 后 31 个 epoch 无改善 |
+| V3.0（本次） | 0.40 | **1.50** | 3.9× | 验证最优出现在 epoch 125 |
+
+实测方式：8 卡并行跑了 6 轮共 ~120 组超参（容量 / dropout / weight decay / 学习率 /
+频率卷积层数 / 无源性惩罚 / EMA / 数据增强），每组用 2~3 个随机种子确认稳定性。
+
+### 改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `conf/surrogate.conf` | 重写：`max_epochs` 90→200、`head_dropout` 0→0.25、`weight_decay` 1e-5→2e-3、`lr` 1e-3→5e-3、`head_conv_layers` 3→1；新增 `early_stop_patience` / `early_stop_min_delta` / `grad_clip_norm` / `ema_decay`；`loss` 换成 `PassivityPenalizedLoss` |
+| `src/loss/passivity.py` | **新增**：无源性软约束损失（`PassivityPenalizedLoss`、`passivity_penalty`） |
+| `src/loss/__init__.py` | 导入并注册 `PassivityPenalizedLoss` |
+| `src/surrogate_model_training/main.py` | 新增早停、EMA、梯度裁剪；保存时用 EMA 权重；日志同时打印 val 与 best；修复 `set_reproducible` 判断的是函数对象（恒真）的老 bug |
+| `src/surrogate_model_training/engine.py` | 支持 `grad_clip_norm` / `ema`；新增 `ModelEMA`；逐频点 L1 采集不再只在 `epoch//10==0` 时进行（原条件疑似 `% 10` 写错） |
+| `src/torchutils/common.py` | `StateCheckPoint.restore` 增加形状/键校验，不匹配时告警并从零训练，而不是直接抛异常中断 |
+| `conf/rl.conf` | `surrogate_model` 段同步新结构（`head_conv_layers: 1`、`head_dropout: 0.25`）；`load_from` 指向 `surrogate_output/03/best_checkpoint.pt` |
+| `tests/test_passivity_loss.py` | **新增**：无源性惩罚与嵌套 criterion 构造的单测 |
+| `README.md` | 更新回归头配置示例与调参建议 |
+
+### 关键超参与依据
+
+1. **dropout 0.25（最大单项收益）**：`head_dropout` 作用在「展平 → 投影」那一层，
+   它才是过拟合的主要来源。0 → 0.2 就能把 val L1 从 2.49 降到 2.28。
+2. **weight_decay 2e-3**：5M 参数 / 3762 样本，旧值 1e-5 形同虚设。
+   dropout + wd 组合后 val L1 进一步降到 ~2.0。
+3. **lr 5e-3 + 余弦退火**：小模型 + 强正则下，更大的步长收敛更快也更稳。
+   同一组正则下 lr=1e-3 / 2e-3 / 3e-3 / 5e-3 的 val L1 约为 2.0 / 1.94 / 1.75 / 1.5。
+4. **`head_conv_layers` 3 → 1**：数据里的曲线由 4~8 个真实频点插值而来，
+   更深的频率卷积只是在拟合插值伪影。收益不大但稳定（同配置下 1 层比 3 层
+   约好 0.05~0.2 dB，且参数量更少），故取 1 层。
+5. **无源性软约束 λ=0.05**：见下方「诚实说明」。
+6. **早停 + `max_epochs` 与 `T_max` 一致**：旧版 90 epoch 中后 31 个 epoch 是纯浪费；
+   但 `max_epochs` 同时是余弦退火的 `T_max`，若两者不一致（例如 T_max=300 却早停在 163），
+   学习率还没退到低位就停，val 会明显偏差（实测 1.72 vs 1.50）。
+
+### 诚实说明：无源性约束只解决了一部分
+
+`report.md` 建议把无源性作为损失项。本次实现了，但实测结论是**它主要起正则作用，
+不是硬约束**：
+
+| λ | val L1（2 seed 均值） | 预测越界样本占比 |
+|---:|---:|---:|
+| 0（纯 L1） | ~1.51 | ~95% |
+| 0.05 | **~1.40** | ~95% |
+| 0.1 | ~1.56 | ~82% |
+| 0.3 | ~1.48 | ~83% |
+
+原因：真值本身贴着约束边界（带内 `|S11|^2+|S21|^2` 均值 0.988），dB 空间里
+零点几 dB 的误差就足以越界，平方软惩罚无法彻底消除。要**保证**满足约束，
+需要在输出层做参数化（例如令 `S11 = cosθ·f`、`S21 = sinθ·f` 之类的三角参数化），
+这属于后续工作，本次未做。
+
+同理，本次**没有**解决 `report.md` 第 13 节指出的两个根本问题：
+- 训练集里**没有任何带通滤波器样本**（带内高 + 带外低 = 0 条），
+  代理模型仍然无法学到「通带通、阻带阻」；
+- 代理模型在训练分布外（高填充率）仍然会外推。
+
+因此 **V3.0 的产物只是「更准、更不过拟合的回归器」，不能直接当作可信的 reward**。
+RL 侧仍应按 `report.md` 第 13 节继续加联合密度约束 / 不确定性惩罚 / hinge 化 reward。
+
+### 复现命令
+
+```bash
+# 训练代理模型（约 4 分钟）
+python -m src.surrogate_model_training.main --conf conf/surrogate.conf -o surrogate_output/03
+
+# 查看曲线
+tensorboard --logdir=surrogate_output/
+```
+
+---
+
 ## V1.0
 
 本次全部改动统一记为 **V1.0**，涵盖数据格式、优化目标、奖励函数、模型结构与
@@ -448,3 +530,16 @@ tensorboard --logdir=surrogate_output/     # 或 rl_output/
 
 代理模型改造后第一次训练，建议先确认模型输出的确是 `(B, 303)`、
 且 `Model Parameters` 约为 5.2M（若仍显示 0.19M，说明配置没生效）。
+
+## V3.0（2026-10-18）匹配网络
+
+- 任务从「带通滤波器」改为「匹配网络」：带内需同时存在 S11/S22 深极小值。
+- 频段由 8.4–9.3 GHz 改为 **7.5–9.9 GHz**：真实凹陷样本 24 → 136（训练）、4 → 14（验证）。
+- `ResonanceWeightedLoss` 新增显式凹陷深度、位置、虚假凹陷抑制三项监督。
+- `SpectralHead.freq_mod_rank` 8 → 24，`head_conv_kernel` 5 → 3。
+- 策略预训练新增 `pretrain.min_hamming` 多样性筛选（默认 0 = 关闭）。
+- `MatchingNetworkReward` 新增 `max_dip_bonus_db`，给凹陷奖励封顶。
+- 新增 `conf/surrogate_resonance_v3.conf`、`conf/rl_match_wide.conf`、
+  `tests/test_resonance_loss.py`、`tests/test_matching_reward.py`。
+- 产物：`surrogate_output/11_resonance_wideband`、`rl_output/14_match_wide`。
+- Top-10：S11 凹陷 6.6–10.8 dB、S22 5.4–6.9 dB，填充率 0.43–0.46（分布内）。
